@@ -8,7 +8,13 @@ const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
-const config = JSON.parse(fs.readFileSync("./config.json", "utf-8"));
+const DEFAULT_CONFIG = { ownerNumber: "", prefix: ".", defaultIntervalMinutes: 1 };
+let config = DEFAULT_CONFIG;
+try {
+  config = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync("./config.json", "utf-8")) };
+} catch {
+  console.log("ℹ️ config.json tidak ditemukan, pakai default (prefix '.', interval 1 menit). Nomor tetap wajib lewat env OWNER_NUMBER.");
+}
 // Nomor bisa diisi lewat ENV (dianjurkan di Railway) atau langsung di config.json
 const OWNER_NUMBER = (process.env.OWNER_NUMBER || config.ownerNumber || "").replace(/[^0-9]/g, "");
 const GROUPS_FILE = "./groups.json";
