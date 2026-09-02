@@ -8,7 +8,10 @@ const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
-const DEFAULT_CONFIG = { ownerNumber: "", prefix: ".", defaultIntervalMinutes: 1 };
+const http = require("http");
+const qrcodeTerminal = require("qrcode-terminal");
+const QRCode = require("qrcode");
+const DEFAULT_CONFIG = { ownerNumber: "", prefix: ".", defaultIntervalMinutes: 1, loginMethod: "qr" };
 let config = DEFAULT_CONFIG;
 try {
   config = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync("./config.json", "utf-8")) };
@@ -17,9 +20,53 @@ try {
 }
 // Nomor bisa diisi lewat ENV (dianjurkan di Railway) atau langsung di config.json
 const OWNER_NUMBER = (process.env.OWNER_NUMBER || config.ownerNumber || "").replace(/[^0-9]/g, "");
+// "qr" (default, scan pakai kamera HP) atau "pairing" (masukin kode manual)
+const LOGIN_METHOD = (process.env.LOGIN_METHOD || config.loginMethod || "qr").toLowerCase();
 const GROUPS_FILE = "./groups.json";
 const TARGET_FILE = "./target.json";
 const BC_STATE_FILE = "./bcstate.json";
+
+// ---------- state & server buat nampilin QR lewat browser (berguna banget kalau jalan di Railway) ----------
+let latestQR = null;
+let qrServerStarted = false;
+
+function startQRServer() {
+  if (qrServerStarted) return;
+  qrServerStarted = true;
+  const port = process.env.PORT || 3000;
+  const server = http.createServer(async (req, res) => {
+    if (req.url === "/qr.png") {
+      if (!latestQR) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        return res.end("Belum ada QR aktif (mungkin sudah login atau belum siap).");
+      }
+      try {
+        const buffer = await QRCode.toBuffer(latestQR, { width: 320, margin: 2 });
+        res.writeHead(200, { "Content-Type": "image/png" });
+        return res.end(buffer);
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        return res.end("Gagal generate QR: " + e.message);
+      }
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<title>QR Login WA Bot</title>
+<style>body{font-family:sans-serif;text-align:center;padding-top:40px;background:#111;color:#eee}
+img{background:#fff;padding:16px;border-radius:8px}</style></head>
+<body>
+<h2>Scan QR buat login WA</h2>
+${latestQR
+  ? `<img src="/qr.png" alt="QR Code" />`
+  : `<p>Menunggu QR baru dari WhatsApp... (halaman auto-refresh tiap 5 detik)</p>`}
+<p style="opacity:.6">Halaman ini auto-refresh sendiri. Buka WhatsApp &gt; Perangkat Tertaut &gt; Tautkan perangkat, lalu scan.</p>
+</body></html>`);
+  });
+  server.listen(port, () => {
+    console.log(`🌐 Halaman QR bisa dibuka di http://localhost:${port} (kalau di Railway, buka lewat domain public dari Settings > Networking > Generate Domain)`);
+  });
+}
 
 // ---------- helper penyimpanan sederhana pakai file JSON ----------
 function readJSON(file, fallback) {
@@ -53,8 +100,8 @@ async function startBot() {
     logger: pino({ level: "silent" }),
   });
 
-  // ---------- Pairing code login ----------
-  if (!sock.authState.creds.registered) {
+  // ---------- Login: pairing code ATAU QR code, tergantung LOGIN_METHOD ----------
+  if (!sock.authState.creds.registered && LOGIN_METHOD === "pairing") {
     if (!OWNER_NUMBER) {
       console.error(
         "\n❌ Nomor WA belum diset. Isi environment variable OWNER_NUMBER (contoh: 628123456789) " +
@@ -75,16 +122,30 @@ async function startBot() {
     }, 2000);
   }
 
+  // Server QR cuma perlu jalan sekali (kalau dipakai), biar ga tabrakan port pas reconnect
+  if (LOGIN_METHOD === "qr" && !sock.authState.creds.registered) {
+    startQRServer();
+  }
+
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr && LOGIN_METHOD === "qr") {
+      latestQR = qr;
+      console.log("\n=== SCAN QR CODE INI (WhatsApp > Perangkat Tertaut > Tautkan perangkat) ===");
+      qrcodeTerminal.generate(qr, { small: true });
+      console.log("Kalau QR di atas ga kebaca/ke-scan (sering kejadian di log Railway), buka halaman web-nya aja — lebih jelas.\n");
+    }
+
     if (connection === "close") {
       const shouldReconnect =
         new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log("Koneksi terputus, reconnect:", shouldReconnect);
       if (shouldReconnect) startBot();
     } else if (connection === "open") {
+      latestQR = null;
       console.log("✅ Bot tersambung ke WhatsApp!");
       // Kalau ada broadcast interval yang tadinya aktif sebelum bot restart, nyalain lagi
       if (bcState) {
